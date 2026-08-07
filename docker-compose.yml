@@ -1,0 +1,23 @@
+services:
+  iptv-proxy:
+    build:
+      context: .
+      args:
+        IPTV_PROXY_PORT: ${IPTV_PROXY_PORT:-1200}
+    image: iptv-proxy:latest
+    container_name: iptv-proxy
+    restart: unless-stopped
+    environment:
+      # Единственное место, откуда сервер узнаёт порт, когда запущен в
+      # Docker. Значение подставляется из .env (или переменных окружения
+      # хоста) и ниже используется и для publish-порта - таким образом
+      # bind-порт сервера, порт в ссылках плейлиста (host_name:port) и
+      # порт, торчащий наружу из контейнера, гарантированно совпадают.
+      IPTV_PROXY_PORT: ${IPTV_PROXY_PORT:-1200}
+    ports:
+      - "${IPTV_PROXY_PORT:-1200}:${IPTV_PROXY_PORT:-1200}"
+    volumes:
+      # Правите config.py на хосте (добавляете провайдеров, меняете
+      # host_name и т.д.) и перезапускаете контейнер - пересборка образа
+      # не требуется.
+      - ./config.py:/app/config.py:ro
