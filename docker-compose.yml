@@ -14,6 +14,16 @@ services:
       # bind-порт сервера, порт в ссылках плейлиста (host_name:port) и
       # порт, торчащий наружу из контейнера, гарантированно совпадают.
       IPTV_PROXY_PORT: ${IPTV_PROXY_PORT:-1200}
+      # Опционально: домен/IP для ссылок в плейлисте, переопределяет
+      # host_name из config.py. Если не задать в .env - останется пустым
+      # здесь, и сервер сам откатится на host_name из config.py (см.
+      # комментарий у HOST_NAME в server.py).
+      IPTV_PROXY_HOST_NAME: ${IPTV_PROXY_HOST_NAME:-}
+      # Пароль для /admin/ (HTTP Basic Auth, без системы пользователей).
+      # Пусто/не задано - /admin/ остаётся открытым, как раньше (см.
+      # предупреждение в логе при старте).
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
     ports:
       - "${IPTV_PROXY_PORT:-1200}:${IPTV_PROXY_PORT:-1200}"
     volumes:

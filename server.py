@@ -20,6 +20,7 @@ IPTV / HLS restream proxy.
 
 import asyncio
 import base64
+import hmac
 import html
 import logging
 import os
@@ -45,6 +46,23 @@ log = logging.getLogger('iptv-proxy')
 # порт контейнера. Если переменная не задана - используется config.port,
 # как и раньше (обычный запуск без Docker).
 PORT = int(os.environ.get('IPTV_PROXY_PORT', config.port))
+
+# Аналогично для host_name - тот же паттерн "одно значение из .env",
+# удобно, когда домен/IP меняется в зависимости от окружения (staging/prod,
+# смена хостинга и т.п.) без правки config.py на сервере.
+# "or" вместо второго аргумента os.environ.get() - принципиально: в
+# docker-compose переменная передаётся всегда (см. environment: в
+# docker-compose.yml), и если в .env она не задана, внутрь контейнера
+# попадёт ПУСТАЯ СТРОКА, а не отсутствующая переменная - .get(key, default)
+# в этом случае вернул бы '', а не откатился на config.host_name.
+HOST_NAME = os.environ.get('IPTV_PROXY_HOST_NAME') or config.host_name
+
+# Базовая защита /admin/ - HTTP Basic Auth, без системы пользователей:
+# один логин/пароль из окружения (.env). Если ADMIN_PASSWORD не задан -
+# /admin/ остаётся открытым, как раньше (чтобы апгрейд не запирал
+# существующие деплойменты без предупреждения - см. warning в on_startup).
+ADMIN_USER = os.environ.get('ADMIN_USER') or 'admin'
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or ''
 
 SCHEME = getattr(config, 'scheme', 'http')
 USER_AGENT = getattr(config, 'user_agent', 'Mozilla/5.0 (IPTV-Proxy)')
@@ -118,7 +136,7 @@ def base_url_of(url: str) -> str:
 
 
 def proxy_root_for(key: str) -> str:
-    return f'{SCHEME}://{config.host_name}:{PORT}/{key}'
+    return f'{SCHEME}://{HOST_NAME}:{PORT}/{key}'
 
 
 def make_proxy_url(proxy_root: str, abs_url: str) -> str:
@@ -356,8 +374,8 @@ async def handler_index(request: web.Request):
     """Небольшая служебная страница со списком доступных каналов."""
     lines = ['IPTV proxy is running.\n\nAvailable channels:\n']
     for k in providers_store.list_all():
-        lines.append(f'  http://{config.host_name}:{PORT}/{k}/')
-    lines.append(f'\nУправление провайдерами: http://{config.host_name}:{PORT}/admin/')
+        lines.append(f'  http://{HOST_NAME}:{PORT}/{k}/')
+    lines.append(f'\nУправление провайдерами: http://{HOST_NAME}:{PORT}/admin/')
     return web.Response(text='\n'.join(lines), content_type='text/plain')
 
 
@@ -550,6 +568,36 @@ async def handler_admin_delete(request: web.Request):
     raise web.HTTPSeeOther('/admin/?msg=deleted')
 
 
+def _basic_auth_ok(request: web.Request) -> bool:
+    auth_header = request.headers.get('Authorization', '')
+    scheme, _, encoded = auth_header.partition(' ')
+    if scheme != 'Basic' or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded).decode('utf-8')
+    except Exception:
+        return False
+    user, _, password = decoded.partition(':')
+    # hmac.compare_digest - сравнение за постоянное время, чтобы не давать
+    # утечку через тайминг посимвольного сравнения пароля.
+    return hmac.compare_digest(user, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASSWORD)
+
+
+@web.middleware
+async def admin_auth_middleware(request: web.Request, handler):
+    """HTTP Basic Auth на /admin/* - без системы пользователей, один общий
+    логин/пароль из .env (ADMIN_USER/ADMIN_PASSWORD). Если ADMIN_PASSWORD
+    не задан, проверка выключена - /admin/ открыт, как раньше."""
+    if ADMIN_PASSWORD and request.path.startswith('/admin'):
+        if not _basic_auth_ok(request):
+            return web.Response(
+                status=401,
+                headers={'WWW-Authenticate': 'Basic realm="iptv-proxy admin"'},
+                text='Unauthorized',
+            )
+    return await handler(request)
+
+
 # --------------------------------------------------------------------------
 # Приложение
 # --------------------------------------------------------------------------
@@ -560,9 +608,11 @@ async def on_startup(app):
     log.info('IPTV proxy started on 0.0.0.0:%s', PORT)
     providers = providers_store.list_all()
     if not providers:
-        log.warning("Провайдеров нет - добавьте через http://%s:%s/admin/", config.host_name, PORT)
+        log.warning("Провайдеров нет - добавьте через http://%s:%s/admin/", HOST_NAME, PORT)
     for k in providers:
-        log.info("  channel '%s' -> %s://%s:%s/%s/", k, SCHEME, config.host_name, PORT, k)
+        log.info("  channel '%s' -> %s://%s:%s/%s/", k, SCHEME, HOST_NAME, PORT, k)
+    if not ADMIN_PASSWORD:
+        log.warning("ADMIN_PASSWORD не задан - /admin/ открыт БЕЗ пароля")
 
 
 async def on_cleanup(app):
@@ -570,7 +620,7 @@ async def on_cleanup(app):
 
 
 def create_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[admin_auth_middleware])
     app.router.add_route('OPTIONS', '/{tail:.*}', handler_options)
     app.router.add_get('/', handler_index)
     # Роуты /admin/* и алиасы с расширением - должны быть зарегистрированы
