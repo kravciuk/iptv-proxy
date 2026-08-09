@@ -20,6 +20,7 @@ IPTV / HLS restream proxy.
 
 import asyncio
 import base64
+import html
 import logging
 import os
 import re
@@ -29,6 +30,7 @@ import aiohttp
 from aiohttp import web
 
 import config
+import providers_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,16 +85,16 @@ def playlist_content_type(text: str) -> str:
 
 # --------------------------------------------------------------------------
 # Конфигурация провайдеров
+#
+# Список провайдеров больше не хранится в config.py - он живёт в
+# providers_store (data/providers.json) и управляется через /admin/ или
+# прямой правкой этого файла. config.py используется только один раз, как
+# начальные данные при самом первом запуске (см. providers_store.load()).
 # --------------------------------------------------------------------------
 
 def get_provider_entry(key):
     """Возвращает (url, extra_headers) для ключа провайдера или (None, None)."""
-    entry = config.provider.get(key)
-    if entry is None:
-        return None, None
-    if isinstance(entry, dict):
-        return entry.get('url'), entry.get('headers') or {}
-    return entry, {}
+    return providers_store.get(key)
 
 
 # --------------------------------------------------------------------------
@@ -320,9 +322,9 @@ async def handler_playlist_ext(request: web.Request):
 
 async def handler_resource(request: web.Request):
     key = request.match_info['key']
-    if key not in config.provider:
-        raise web.HTTPNotFound(text='Unknown provider key: %s' % key)
     _, extra_headers = get_provider_entry(key)
+    if extra_headers is None:
+        raise web.HTTPNotFound(text='Unknown provider key: %s' % key)
 
     raw = request.match_info['token']
     if '.' in raw:
@@ -353,9 +355,199 @@ async def handler_options(request: web.Request):
 async def handler_index(request: web.Request):
     """Небольшая служебная страница со списком доступных каналов."""
     lines = ['IPTV proxy is running.\n\nAvailable channels:\n']
-    for k in config.provider:
+    for k in providers_store.list_all():
         lines.append(f'  http://{config.host_name}:{PORT}/{k}/')
+    lines.append(f'\nУправление провайдерами: http://{config.host_name}:{PORT}/admin/')
     return web.Response(text='\n'.join(lines), content_type='text/plain')
+
+
+# --------------------------------------------------------------------------
+# Веб-интерфейс управления провайдерами (/admin/)
+#
+# Без авторизации - как и весь сервис по условию задачи. Любой, кто может
+# достучаться до порта прокси, может смотреть/добавлять/менять/удалять
+# провайдеров через эту страницу. Изменения применяются сразу же (пишутся
+# в data/providers.json через providers_store).
+# --------------------------------------------------------------------------
+
+KEY_RE = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _validate_key(key: str):
+    if not key:
+        return 'Ключ обязателен'
+    if not KEY_RE.match(key):
+        return 'Ключ может содержать только латинские буквы, цифры, "-" и "_"'
+    if key in providers_store.RESERVED_KEYS:
+        return f'Ключ "{key}" зарезервирован, выберите другой'
+    return None
+
+
+def _validate_url(url: str):
+    if not url:
+        return 'URL обязателен'
+    if not (url.startswith('http://') or url.startswith('https://')):
+        return 'URL должен начинаться с http:// или https://'
+    return None
+
+
+def _parse_headers(text: str):
+    """Построчный разбор 'Имя: значение' -> (dict, error)."""
+    headers = {}
+    for i, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ':' not in line:
+            return None, f'Строка {i} заголовков не в формате "Имя: значение": {line!r}'
+        name, value = line.split(':', 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            return None, f'Строка {i}: пустое имя заголовка'
+        headers[name] = value
+    return headers, None
+
+
+def _headers_to_text(headers: dict) -> str:
+    return '\n'.join(f'{k}: {v}' for k, v in (headers or {}).items())
+
+
+def render_admin_page(providers, message=None, error=None,
+                       form_key='', form_url='', form_headers_text='',
+                       edit_mode=False):
+    e = html.escape
+    rows = []
+    for key in sorted(providers):
+        entry = providers[key]
+        n_headers = len(entry['headers'])
+        headers_note = f'{n_headers} доп. заголовок(ов)' if n_headers else '-'
+        rows.append(f'''
+        <tr>
+          <td><code>{e(key)}</code></td>
+          <td class="url-cell"><code>{e(entry['url'])}</code></td>
+          <td>{headers_note}</td>
+          <td class="actions">
+            <a href="/{e(key)}/" target="_blank">Открыть</a>
+            <a href="/admin/edit/{e(key)}">Изменить</a>
+            <form method="post" action="/admin/delete/{e(key)}" class="inline">
+              <button type="submit" class="danger">Удалить</button>
+            </form>
+          </td>
+        </tr>''')
+
+    rows_html = ''.join(rows) if rows else '<tr><td colspan="4"><em>Провайдеров пока нет</em></td></tr>'
+    message_html = f'<p class="msg ok">{e(message)}</p>' if message else ''
+    error_html = f'<p class="msg err">{e(error)}</p>' if error else ''
+    form_title = 'Изменить провайдера' if edit_mode else 'Добавить провайдера'
+    key_field = (
+        f'<input type="text" name="key" value="{e(form_key)}" readonly>'
+        if edit_mode else
+        '<input type="text" name="key" placeholder="one" required pattern="[A-Za-z0-9_-]+">'
+    )
+    cancel_link = '<a href="/admin/">Отмена</a>' if edit_mode else ''
+
+    return f'''<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>IPTV proxy - провайдеры</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; color: #222; }}
+  table {{ border-collapse: collapse; width: 100%; margin-bottom: 2em; }}
+  th, td {{ border: 1px solid #ccc; padding: 0.5em; text-align: left; vertical-align: top; }}
+  .url-cell {{ max-width: 320px; overflow-wrap: anywhere; }}
+  .actions a, .actions button {{ margin-right: 0.5em; }}
+  form.inline {{ display: inline; }}
+  button.danger {{ color: #b00020; }}
+  label {{ display: block; margin-top: 0.75em; }}
+  input[type=text], textarea {{ width: 100%; box-sizing: border-box; padding: 0.4em; }}
+  textarea {{ height: 4em; font-family: monospace; }}
+  .msg {{ padding: 0.6em 1em; border-radius: 4px; }}
+  .msg.ok {{ background: #e6ffed; border: 1px solid #4caf50; }}
+  .msg.err {{ background: #ffe8e8; border: 1px solid #d32f2f; }}
+  code {{ word-break: break-all; }}
+</style>
+</head>
+<body>
+<h1>IPTV proxy - провайдеры</h1>
+<p><em>Без авторизации: любой, кто откроет эту страницу, может добавлять,
+менять и удалять провайдеров.</em></p>
+{message_html}{error_html}
+<table>
+  <thead><tr><th>Ключ</th><th>URL</th><th>Заголовки</th><th>Действия</th></tr></thead>
+  <tbody>{rows_html}</tbody>
+</table>
+
+<h2>{form_title}</h2>
+<form method="post" action="/admin/save">
+  <label>Ключ (используется в адресе /&lt;ключ&gt;/)
+    {key_field}
+  </label>
+  <label>URL плейлиста провайдера
+    <input type="text" name="url" value="{e(form_url)}" placeholder="https://provide.one/list.m3u8" required>
+  </label>
+  <details>
+    <summary>Дополнительные заголовки (опционально)</summary>
+    <label>По одному заголовку на строку, формат "Имя: значение"
+      <textarea name="headers">{e(form_headers_text)}</textarea>
+    </label>
+  </details>
+  <p><button type="submit">Сохранить</button> {cancel_link}</p>
+</form>
+</body>
+</html>
+'''
+
+
+async def handler_admin_index(request: web.Request):
+    msg = request.query.get('msg')
+    message = {'saved': 'Сохранено', 'deleted': 'Удалено'}.get(msg)
+    body = render_admin_page(providers_store.list_all(), message=message)
+    return web.Response(text=body, content_type='text/html')
+
+
+async def handler_admin_edit(request: web.Request):
+    key = request.match_info['key']
+    url, headers = providers_store.get(key)
+    if url is None:
+        raise web.HTTPNotFound(text='Unknown provider key: %s' % key)
+    body = render_admin_page(
+        providers_store.list_all(),
+        form_key=key, form_url=url, form_headers_text=_headers_to_text(headers),
+        edit_mode=True,
+    )
+    return web.Response(text=body, content_type='text/html')
+
+
+async def handler_admin_save(request: web.Request):
+    data = await request.post()
+    key = (data.get('key') or '').strip()
+    url = (data.get('url') or '').strip()
+    headers_text = data.get('headers') or ''
+
+    key_error = _validate_key(key)
+    url_error = _validate_url(url)
+    headers, headers_error = _parse_headers(headers_text)
+    error = key_error or url_error or headers_error
+
+    if error:
+        edit_mode = key in providers_store.list_all()
+        body = render_admin_page(
+            providers_store.list_all(), error=error,
+            form_key=key, form_url=url, form_headers_text=headers_text,
+            edit_mode=edit_mode,
+        )
+        return web.Response(text=body, content_type='text/html', status=400)
+
+    await providers_store.save(key, url, headers)
+    raise web.HTTPSeeOther('/admin/?msg=saved')
+
+
+async def handler_admin_delete(request: web.Request):
+    key = request.match_info['key']
+    await providers_store.delete(key)
+    raise web.HTTPSeeOther('/admin/?msg=deleted')
 
 
 # --------------------------------------------------------------------------
@@ -364,8 +556,12 @@ async def handler_index(request: web.Request):
 
 async def on_startup(app):
     app['session'] = aiohttp.ClientSession()
+    providers_store.load(seed_from=getattr(config, 'provider', None))
     log.info('IPTV proxy started on 0.0.0.0:%s', PORT)
-    for k in config.provider:
+    providers = providers_store.list_all()
+    if not providers:
+        log.warning("Провайдеров нет - добавьте через http://%s:%s/admin/", config.host_name, PORT)
+    for k in providers:
         log.info("  channel '%s' -> %s://%s:%s/%s/", k, SCHEME, config.host_name, PORT, k)
 
 
@@ -374,14 +570,17 @@ async def on_cleanup(app):
 
 
 def create_app() -> web.Application:
-    if not getattr(config, 'provider', None):
-        raise RuntimeError('config.provider is empty - nothing to serve')
-
     app = web.Application()
     app.router.add_route('OPTIONS', '/{tail:.*}', handler_options)
     app.router.add_get('/', handler_index)
-    # Алиасы с расширением - должны быть зарегистрированы РАНЬШЕ общего
-    # '/{key}', иначе тот перехватит их первым (например, ключ 'one.m3u8').
+    # Роуты /admin/* и алиасы с расширением - должны быть зарегистрированы
+    # РАНЬШЕ общего '/{key}', иначе тот перехватит их первым (например,
+    # ключ 'admin' или 'one.m3u8'). 'admin' поэтому же зарезервирован как
+    # имя ключа провайдера (см. providers_store.RESERVED_KEYS).
+    app.router.add_get('/admin/', handler_admin_index)
+    app.router.add_get('/admin/edit/{key}', handler_admin_edit)
+    app.router.add_post('/admin/save', handler_admin_save)
+    app.router.add_post('/admin/delete/{key}', handler_admin_delete)
     app.router.add_get('/{key}.m3u8', handler_playlist_ext)
     app.router.add_get('/{key}.m3u', handler_playlist_ext)
     app.router.add_get('/{key}/playlist.m3u8', handler_playlist_ext)

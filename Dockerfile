@@ -6,7 +6,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY server.py providers_store.py .
 
 # config.py НАМЕРЕННО не копируется в образ. Он содержит список провайдеров
 # и всегда монтируется как volume в docker-compose.yml - это даёт
