@@ -24,6 +24,8 @@ services:
       # предупреждение в логе при старте).
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # Адрес панели управления (/<ADMIN_PATH>/), по умолчанию admin.
+      ADMIN_PATH: ${ADMIN_PATH:-admin}
       # INFO (по умолчанию) или DEBUG - с DEBUG в лог пишется ещё и строка
       # на каждый HTTP-запрос (access-лог), включая каждый сегмент.
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

@@ -97,6 +97,18 @@ HOST_NAME = os.environ.get('IPTV_PROXY_HOST_NAME') or config.host_name
 ADMIN_USER = os.environ.get('ADMIN_USER') or 'admin'
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or ''
 
+# Адрес панели управления: http://<host>:<port>/<ADMIN_PATH>/. Нестандартное
+# значение прячет панель от сканеров, которые перебирают /admin/. Один
+# сегмент пути (без "/"), он же зарезервирован - провайдера с таким ключом
+# создать нельзя (его адреса перекрыла бы панель).
+ADMIN_PATH = (os.environ.get('ADMIN_PATH') or 'admin').strip('/')
+if not re.match(r'^[A-Za-z0-9_-]+$', ADMIN_PATH):
+    raise SystemExit(
+        f'ADMIN_PATH={ADMIN_PATH!r}: допустимы только латинские буквы, цифры, "-" и "_" '
+        '(один сегмент пути, например ADMIN_PATH=panel-x7Gk2q)'
+    )
+ADMIN_PREFIX = f'/{ADMIN_PATH}'
+
 # Брать IP клиента из X-Forwarded-For (последний адрес - тот, что дописал
 # наш nginx). Включать ТОЛЬКО если прокси доступен исключительно через
 # nginx: при прямом доступе заголовок подделывается клиентом, и блокировку
@@ -497,12 +509,16 @@ async def handler_redirect_to_slash(request: web.Request):
 
 async def handler_not_found(request: web.Request):
     """Любой другой путь /<key>/... - 404. Для несуществующего ключа ещё и
-    warning в лог (через require_provider); /admin/... не логируем как
-    "несуществующий ключ" - это зарезервированное имя, а не провайдер."""
+    warning в лог (через require_provider); /<ADMIN_PATH>/... не логируем
+    как "несуществующий ключ" - это панель управления, а не провайдер."""
     key = request.match_info['key']
-    if key not in providers_store.RESERVED_KEYS:
+    if key != ADMIN_PATH:
         require_provider(request, key)
     raise web.HTTPNotFound()
+
+
+async def handler_admin_redirect_to_slash(request: web.Request):
+    raise web.HTTPFound(f'{ADMIN_PREFIX}/')
 
 
 async def handler_options(request: web.Request):
@@ -510,19 +526,17 @@ async def handler_options(request: web.Request):
 
 
 async def handler_index(request: web.Request):
-    """Корень ничего не раскрывает (ни список каналов, ни адрес /admin/) -
+    """Корень ничего не раскрывает (ни список каналов, ни адрес панели) -
     иначе любой, кто наткнулся на порт, сразу видит все ключи провайдеров.
     Роут нужен явно: без него GET / получил бы 405 от OPTIONS catch-all."""
     raise web.HTTPForbidden()
 
 
 # --------------------------------------------------------------------------
-# Веб-интерфейс управления провайдерами (/admin/)
+# Веб-интерфейс управления провайдерами (/<ADMIN_PATH>/, по умолчанию /admin/)
 #
-# Без авторизации - как и весь сервис по условию задачи. Любой, кто может
-# достучаться до порта прокси, может смотреть/добавлять/менять/удалять
-# провайдеров через эту страницу. Изменения применяются сразу же (пишутся
-# в data/providers.json через providers_store).
+# Закрыт Basic Auth (см. admin_auth_middleware). Изменения применяются сразу
+# же (пишутся в data/providers.json через providers_store).
 # --------------------------------------------------------------------------
 
 KEY_RE = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -533,7 +547,7 @@ def _validate_key(key: str):
         return 'Ключ обязателен'
     if not KEY_RE.match(key):
         return 'Ключ может содержать только латинские буквы, цифры, "-" и "_"'
-    if key in providers_store.RESERVED_KEYS:
+    if key == ADMIN_PATH:
         return f'Ключ "{key}" зарезервирован, выберите другой'
     return None
 
@@ -586,8 +600,8 @@ def render_admin_page(providers, message=None, error=None,
           <td>{headers_note}</td>
           <td class="actions">
             <a href="/{e(key)}/" target="_blank">Открыть</a>
-            <a href="/admin/edit/{e(key)}">Изменить</a>
-            <form method="post" action="/admin/delete/{e(key)}" class="inline">
+            <a href="{e(ADMIN_PREFIX)}/edit/{e(key)}">Изменить</a>
+            <form method="post" action="{e(ADMIN_PREFIX)}/delete/{e(key)}" class="inline">
               <button type="submit" class="danger">Удалить</button>
             </form>
           </td>
@@ -608,7 +622,7 @@ def render_admin_page(providers, message=None, error=None,
         ' в IPTV-приложениях нужно будет указать новый.</p>'
         if edit_mode else ''
     )
-    cancel_link = '<a href="/admin/">Отмена</a>' if edit_mode else ''
+    cancel_link = f'<a href="{e(ADMIN_PREFIX)}/">Отмена</a>' if edit_mode else ''
 
     return f'''<!doctype html>
 <html lang="ru">
@@ -644,7 +658,7 @@ def render_admin_page(providers, message=None, error=None,
 </table>
 
 <h2>{form_title}</h2>
-<form method="post" action="/admin/save">
+<form method="post" action="{e(ADMIN_PREFIX)}/save">
   <label for="key">Ключ (используется в адресе /&lt;ключ&gt;/)</label>
   <div class="key-row">{key_field}</div>
   {original_key_field}
@@ -745,7 +759,7 @@ async def handler_admin_save(request: web.Request):
         await providers_store.save(key, url, headers)
         log.warning('Админка: изменён провайдер %r url=%r (было %r) заголовки=%r %s',
                     key, url, old_url, sorted(headers), client_desc(request))
-    raise web.HTTPSeeOther('/admin/?msg=saved')
+    raise web.HTTPSeeOther(f'{ADMIN_PREFIX}/?msg=saved')
 
 
 async def handler_admin_delete(request: web.Request):
@@ -754,7 +768,7 @@ async def handler_admin_delete(request: web.Request):
     await providers_store.delete(key)
     if old_url is not None:
         log.warning('Админка: удалён провайдер %r url=%r %s', key, old_url, client_desc(request))
-    raise web.HTTPSeeOther('/admin/?msg=deleted')
+    raise web.HTTPSeeOther(f'{ADMIN_PREFIX}/?msg=deleted')
 
 
 def _basic_auth_user(request: web.Request):
@@ -807,7 +821,7 @@ def _register_auth_failure(ip: str, now: float) -> bool:
 
 
 def _same_origin(request: web.Request) -> bool:
-    """POST в /admin/ принимаем только со страниц самого прокси (защита от
+    """POST в панель принимаем только со страниц самого прокси (защита от
     CSRF: Basic Auth браузер подставляет в запрос с ЛЮБОГО сайта). Браузеры
     всегда шлют Origin на POST; Referer - запасной вариант."""
     source = request.headers.get('Origin') or request.headers.get('Referer')
@@ -820,10 +834,10 @@ def _same_origin(request: web.Request) -> bool:
 
 @web.middleware
 async def admin_auth_middleware(request: web.Request, handler):
-    """HTTP Basic Auth на /admin/* - без системы пользователей, один общий
-    логин/пароль из .env (ADMIN_USER/ADMIN_PASSWORD). Если ADMIN_PASSWORD
-    не задан, /admin/ выключен (404)."""
-    if not request.path.startswith('/admin'):
+    """HTTP Basic Auth на /<ADMIN_PATH>/* - без системы пользователей, один
+    общий логин/пароль из .env (ADMIN_USER/ADMIN_PASSWORD). Если
+    ADMIN_PASSWORD не задан, панель выключена (404)."""
+    if request.path != ADMIN_PREFIX and not request.path.startswith(ADMIN_PREFIX + '/'):
         return await handler(request)
     if not ADMIN_PASSWORD:
         raise web.HTTPNotFound()
@@ -871,12 +885,18 @@ async def on_startup(app):
     log.info('IPTV proxy started on 0.0.0.0:%s', PORT)
     providers = providers_store.list_all()
     if not providers:
-        log.warning("Провайдеров нет - добавьте через http://%s:%s/admin/", HOST_NAME, PORT)
+        log.warning("Провайдеров нет - добавьте через http://%s:%s%s/", HOST_NAME, PORT, ADMIN_PREFIX)
     for k in providers:
         log.info("  channel '%s' -> %s://%s:%s/%s/", k, SCHEME, HOST_NAME, PORT, k)
+    if ADMIN_PATH in providers:
+        log.warning("Провайдер с ключом %r недоступен: этот адрес занят панелью управления "
+                    "(ADMIN_PATH). Переименуйте провайдера в панели или смените ADMIN_PATH",
+                    ADMIN_PATH)
     if not ADMIN_PASSWORD:
-        log.warning("ADMIN_PASSWORD не задан - /admin/ ВЫКЛЮЧЕН (404). "
-                    "Задайте ADMIN_PASSWORD в .env, чтобы управлять провайдерами")
+        log.warning("ADMIN_PASSWORD не задан - панель управления %s/ ВЫКЛЮЧЕНА (404). "
+                    "Задайте ADMIN_PASSWORD в .env, чтобы управлять провайдерами", ADMIN_PREFIX)
+    else:
+        log.info("Панель управления: %s://%s:%s%s/", SCHEME, HOST_NAME, PORT, ADMIN_PREFIX)
 
 
 async def on_cleanup(app):
@@ -887,14 +907,15 @@ def create_app() -> web.Application:
     app = web.Application(middlewares=[admin_auth_middleware])
     app.router.add_route('OPTIONS', '/{tail:.*}', handler_options)
     app.router.add_get('/', handler_index)
-    # Роуты /admin/* и алиасы с расширением - должны быть зарегистрированы
+    # Роуты панели и алиасы с расширением - должны быть зарегистрированы
     # РАНЬШЕ общего '/{key}', иначе тот перехватит их первым (например,
-    # ключ 'admin' или 'one.m3u8'). 'admin' поэтому же зарезервирован как
-    # имя ключа провайдера (см. providers_store.RESERVED_KEYS).
-    app.router.add_get('/admin/', handler_admin_index)
-    app.router.add_get('/admin/edit/{key}', handler_admin_edit)
-    app.router.add_post('/admin/save', handler_admin_save)
-    app.router.add_post('/admin/delete/{key}', handler_admin_delete)
+    # ключ ADMIN_PATH или 'one.m3u8'). ADMIN_PATH поэтому же зарезервирован
+    # как имя ключа провайдера (см. _validate_key).
+    app.router.add_get(ADMIN_PREFIX, handler_admin_redirect_to_slash)
+    app.router.add_get(f'{ADMIN_PREFIX}/', handler_admin_index)
+    app.router.add_get(f'{ADMIN_PREFIX}/edit/{{key}}', handler_admin_edit)
+    app.router.add_post(f'{ADMIN_PREFIX}/save', handler_admin_save)
+    app.router.add_post(f'{ADMIN_PREFIX}/delete/{{key}}', handler_admin_delete)
     app.router.add_get('/{key}.m3u8', handler_playlist_ext)
     app.router.add_get('/{key}.m3u', handler_playlist_ext)
     app.router.add_get('/{key}/playlist.m3u8', handler_playlist_ext)

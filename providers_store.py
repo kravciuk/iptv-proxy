@@ -5,7 +5,7 @@
 Раньше provider = {...} жил только в config.py и менялся правкой файла +
 перезапуском процесса. Теперь это отдельный JSON-файл на диске
 (data/providers.json), которым можно управлять как через веб-интерфейс
-(/admin/, мгновенно), так и вручную (правка файла, применяется после
+(панель управления /<ADMIN_PATH>/, мгновенно), так и вручную (правка файла, применяется после
 перезапуска - как раньше config.py).
 
 Формат файла: {"<key>": {"url": "...", "headers": {...}}, ...}
@@ -20,10 +20,6 @@ log = logging.getLogger('iptv-proxy')
 
 DATA_DIR = os.environ.get('IPTV_PROXY_DATA_DIR', 'data')
 DATA_FILE = os.path.join(DATA_DIR, 'providers.json')
-
-# Ключ 'admin' зарезервирован под веб-интерфейс управления - провайдер с
-# таким именем создать нельзя (см. валидацию в server.py).
-RESERVED_KEYS = {'admin'}
 
 PROVIDERS = {}
 _lock = asyncio.Lock()
@@ -83,7 +79,7 @@ def get(key):
 
 
 def list_all():
-    """dict {key: {"url":..., "headers":...}} - для рендера /admin/."""
+    """dict {key: {"url":..., "headers":...}} - для рендера панели управления."""
     return dict(PROVIDERS)
 
 
