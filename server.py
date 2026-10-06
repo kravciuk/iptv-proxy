@@ -36,15 +36,42 @@ from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from aiohttp import web
+from aiohttp.abc import AbstractAccessLogger
 
 import config
 import providers_store
 
+# Уровень логов из окружения (.env): INFO по умолчанию, DEBUG - в т.ч.
+# строка access-лога на КАЖДЫЙ запрос (см. DebugAccessLogger ниже).
+LOG_LEVEL = (os.environ.get('LOG_LEVEL') or 'INFO').upper()
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format='%(asctime)s [%(levelname)s] %(message)s',
 )
 log = logging.getLogger('iptv-proxy')
+
+
+class DebugAccessLogger(AbstractAccessLogger):
+    """Access-лог aiohttp на уровне DEBUG вместо INFO. Строка пишется на
+    каждый запрос, включая каждый сегмент .ts - на INFO это забивало лог.
+    Значимые события (несуществующие ключи, админка, ошибки провайдера)
+    пишутся отдельно, на WARNING. Referer/User-Agent через %r - в них может
+    быть что угодно от клиента, в т.ч. переводы строк."""
+
+    @property
+    def enabled(self) -> bool:
+        # aiohttp >= 3.10 не вызывает log() вовсе, если False.
+        return self.logger.isEnabledFor(logging.DEBUG)
+
+    def log(self, request, response, time):
+        self.logger.debug(
+            '%s "%s %s HTTP/%d.%d" %s %s %.3fs referer=%r ua=%r',
+            request.remote, request.method, request.path_qs,
+            request.version.major, request.version.minor,
+            response.status, response.body_length, time,
+            request.headers.get('Referer'), request.headers.get('User-Agent'),
+        )
 
 # Порт можно переопределить переменной окружения IPTV_PROXY_PORT - это
 # нужно для docker-compose, где порт должен быть ОДНИМ значением сразу
@@ -883,4 +910,5 @@ def create_app() -> web.Application:
 
 
 if __name__ == '__main__':
-    web.run_app(create_app(), host='0.0.0.0', port=PORT)
+    web.run_app(create_app(), host='0.0.0.0', port=PORT,
+                access_log_class=DebugAccessLogger)

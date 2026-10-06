@@ -24,6 +24,9 @@ services:
       # предупреждение в логе при старте).
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # INFO (по умолчанию) или DEBUG - с DEBUG в лог пишется ещё и строка
+      # на каждый HTTP-запрос (access-лог), включая каждый сегмент.
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
       - "${IPTV_PROXY_PORT:-1200}:${IPTV_PROXY_PORT:-1200}"
     volumes:
