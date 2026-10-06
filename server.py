@@ -543,8 +543,10 @@ def _headers_to_text(headers: dict) -> str:
 
 def render_admin_page(providers, message=None, error=None,
                        form_key='', form_url='', form_headers_text='',
-                       edit_mode=False):
+                       original_key=''):
+    """original_key - ключ редактируемой записи; пусто - форма добавления."""
     e = html.escape
+    edit_mode = bool(original_key)
     rows = []
     for key in sorted(providers):
         entry = providers[key]
@@ -569,11 +571,15 @@ def render_admin_page(providers, message=None, error=None,
     error_html = f'<p class="msg err">{e(error)}</p>' if error else ''
     form_title = 'Изменить провайдера' if edit_mode else 'Добавить провайдера'
     key_field = (
-        f'<input type="text" id="key" name="key" value="{e(form_key)}" readonly>'
-        if edit_mode else
         f'<input type="text" id="key" name="key" value="{e(form_key)}" placeholder="one"'
         ' required pattern="[A-Za-z0-9_-]+">'
         '<button type="button" onclick="generateKey()">Сгенерировать</button>'
+    )
+    original_key_field = (
+        f'<input type="hidden" name="original_key" value="{e(original_key)}">'
+        '<p class="hint">При смене ключа старый адрес канала перестанет работать -'
+        ' в IPTV-приложениях нужно будет указать новый.</p>'
+        if edit_mode else ''
     )
     cancel_link = '<a href="/admin/">Отмена</a>' if edit_mode else ''
 
@@ -594,6 +600,7 @@ def render_admin_page(providers, message=None, error=None,
   input[type=text], textarea {{ width: 100%; box-sizing: border-box; padding: 0.4em; }}
   .key-row {{ display: flex; gap: 0.5em; }}
   .key-row input {{ flex: 1; font-family: monospace; }}
+  .hint {{ margin: 0.3em 0 0; font-size: 0.9em; color: #666; }}
   textarea {{ height: 4em; font-family: monospace; }}
   .msg {{ padding: 0.6em 1em; border-radius: 4px; }}
   .msg.ok {{ background: #e6ffed; border: 1px solid #4caf50; }}
@@ -613,6 +620,7 @@ def render_admin_page(providers, message=None, error=None,
 <form method="post" action="/admin/save">
   <label for="key">Ключ (используется в адресе /&lt;ключ&gt;/)</label>
   <div class="key-row">{key_field}</div>
+  {original_key_field}
   <label>URL плейлиста провайдера
     <input type="text" name="url" value="{e(form_url)}" placeholder="https://provide.one/list.m3u8" required>
   </label>
@@ -658,7 +666,7 @@ async def handler_admin_edit(request: web.Request):
     body = render_admin_page(
         providers_store.list_all(),
         form_key=key, form_url=url, form_headers_text=_headers_to_text(headers),
-        edit_mode=True,
+        original_key=key,
     )
     return web.Response(text=body, content_type='text/html')
 
@@ -668,28 +676,46 @@ async def handler_admin_save(request: web.Request):
     key = (data.get('key') or '').strip()
     url = (data.get('url') or '').strip()
     headers_text = data.get('headers') or ''
+    # Есть original_key - это форма редактирования (ключ мог поменяться),
+    # нет - форма добавления.
+    original_key = (data.get('original_key') or '').strip()
 
-    key_error = _validate_key(key)
-    url_error = _validate_url(url)
+    existing = providers_store.list_all()
+    if original_key and original_key not in existing:
+        error = f'Провайдер "{original_key}" не найден - возможно, его уже удалили'
+        original_key = ''
+    elif key != original_key and key in existing:
+        # И при добавлении, и при переименовании: не затираем молча
+        # чужую запись с таким же ключом.
+        error = f'Ключ "{key}" уже занят другим провайдером'
+    else:
+        # Неизменённый ключ не перепроверяем: правка URL записи со
+        # "старым" ключом (например, из config.py) не должна блокироваться.
+        error = _validate_key(key) if not original_key or key != original_key else None
     headers, headers_error = _parse_headers(headers_text)
-    error = key_error or url_error or headers_error
+    error = error or _validate_url(url) or headers_error
 
     if error:
-        edit_mode = key in providers_store.list_all()
         body = render_admin_page(
-            providers_store.list_all(), error=error,
+            existing, error=error,
             form_key=key, form_url=url, form_headers_text=headers_text,
-            edit_mode=edit_mode,
+            original_key=original_key,
         )
         return web.Response(text=body, content_type='text/html', status=400)
 
-    old_url, _ = providers_store.get(key)
-    await providers_store.save(key, url, headers)
     # Значения заголовков не логируем - там бывают токены провайдера.
-    if old_url is None:
+    if not original_key:
+        await providers_store.save(key, url, headers)
         log.warning('Админка: добавлен провайдер %r url=%r заголовки=%r %s',
                     key, url, sorted(headers), client_desc(request))
+    elif key != original_key:
+        old_url = existing[original_key]['url']
+        await providers_store.rename(original_key, key, url, headers)
+        log.warning('Админка: переименован провайдер %r -> %r url=%r (было %r) заголовки=%r %s',
+                    original_key, key, url, old_url, sorted(headers), client_desc(request))
     else:
+        old_url = existing[key]['url']
+        await providers_store.save(key, url, headers)
         log.warning('Админка: изменён провайдер %r url=%r (было %r) заголовки=%r %s',
                     key, url, old_url, sorted(headers), client_desc(request))
     raise web.HTTPSeeOther('/admin/?msg=saved')

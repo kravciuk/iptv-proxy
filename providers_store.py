@@ -93,6 +93,15 @@ async def save(key, url, headers):
         _write_to_disk(PROVIDERS)
 
 
+async def rename(old_key, new_key, url, headers):
+    """Смена ключа одной записью на диск (без промежуточного состояния,
+    где провайдера нет ни под старым, ни под новым ключом)."""
+    async with _lock:
+        PROVIDERS.pop(old_key, None)
+        PROVIDERS[new_key] = {'url': url, 'headers': dict(headers or {})}
+        _write_to_disk(PROVIDERS)
+
+
 async def delete(key):
     async with _lock:
         PROVIDERS.pop(key, None)
