@@ -20,7 +20,7 @@ services:
       # комментарий у HOST_NAME в server.py).
       IPTV_PROXY_HOST_NAME: ${IPTV_PROXY_HOST_NAME:-}
       # Пароль для /admin/ (HTTP Basic Auth, без системы пользователей).
-      # Пусто/не задано - /admin/ остаётся открытым, как раньше (см.
+      # Пусто/не задано - /admin/ выключен и отвечает 404 (см.
       # предупреждение в логе при старте).
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}

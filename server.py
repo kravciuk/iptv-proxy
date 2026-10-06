@@ -8,10 +8,14 @@ IPTV / HLS restream proxy.
                              EXT-X-KEY, EXT-X-MAP, EXT-X-MEDIA и т.п.) так,
                              чтобы они указывали на наш прокси, и отдаём клиенту.
 
-  GET /<key>/res/<token> -> прокси произвольного ресурса (сегмент .ts/.m4s,
+  GET /<key>/res/<sig>/<token>
+                          -> прокси произвольного ресурса (сегмент .ts/.m4s,
                              ключ шифрования, вложенный вариант-плейлист).
                              <token> - это base64url от исходного абсолютного
-                             URL. Если это плейлист (по расширению .m3u8/.m3u
+                             URL, <sig> - HMAC-подпись пары (<key>, URL), без
+                             верной подписи запрос отклоняется (иначе прокси
+                             можно было бы натравить на произвольный URL).
+                             Если это плейлист (по расширению .m3u8/.m3u
                              либо по Content-Type) - он тоже рекурсивно
                              переписывается, иначе байты стримятся как есть.
 
@@ -20,11 +24,14 @@ IPTV / HLS restream proxy.
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import html
 import logging
 import os
 import re
+import secrets
+import time
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -59,10 +66,22 @@ HOST_NAME = os.environ.get('IPTV_PROXY_HOST_NAME') or config.host_name
 
 # Базовая защита /admin/ - HTTP Basic Auth, без системы пользователей:
 # один логин/пароль из окружения (.env). Если ADMIN_PASSWORD не задан -
-# /admin/ остаётся открытым, как раньше (чтобы апгрейд не запирал
-# существующие деплойменты без предупреждения - см. warning в on_startup).
+# /admin/ ВЫКЛЮЧЕН (404), а не открыт без пароля (см. warning в on_startup).
 ADMIN_USER = os.environ.get('ADMIN_USER') or 'admin'
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD') or ''
+
+# Брать IP клиента из X-Forwarded-For (последний адрес - тот, что дописал
+# наш nginx). Включать ТОЛЬКО если прокси доступен исключительно через
+# nginx: при прямом доступе заголовок подделывается клиентом, и блокировку
+# перебора пароля можно обойти. Без nginx/выключено - IP соединения.
+TRUST_X_FORWARDED_FOR = getattr(config, 'trust_x_forwarded_for', False)
+
+# Защита /admin/ от перебора пароля: после AUTH_MAX_FAILURES неверных
+# попыток с одного IP за AUTH_WINDOW секунд этот IP получает 429 на
+# AUTH_BLOCK секунд (даже с верным паролем).
+AUTH_MAX_FAILURES = 10
+AUTH_WINDOW = 600
+AUTH_BLOCK = 900
 
 SCHEME = getattr(config, 'scheme', 'http')
 USER_AGENT = getattr(config, 'user_agent', 'Mozilla/5.0 (IPTV-Proxy)')
@@ -115,6 +134,37 @@ def get_provider_entry(key):
     return providers_store.get(key)
 
 
+def client_ip(request: web.Request) -> str:
+    if TRUST_X_FORWARDED_FOR:
+        forwarded = request.headers.get('X-Forwarded-For', '')
+        last = forwarded.rsplit(',', 1)[-1].strip()
+        if last:
+            return last
+    return request.remote or '-'
+
+
+def client_desc(request: web.Request) -> str:
+    """Кто обратился - для логов. Значения через %r: в них может быть что
+    угодно от клиента, в т.ч. переводы строк (подделка строк лога)."""
+    return 'ip=%s forwarded-for=%r ua=%r' % (
+        request.remote, request.headers.get('X-Forwarded-For'),
+        request.headers.get('User-Agent'),
+    )
+
+
+def require_provider(request: web.Request, key: str):
+    """(url, extra_headers) для ключа; для несуществующего ключа - warning
+    в лог и 404 без подробностей (не подтверждаем, какие ключи есть)."""
+    url, extra_headers = get_provider_entry(key)
+    if url is None:
+        log.warning(
+            'Обращение к несуществующему ключу %r: %s %r %s',
+            key, request.method, request.path_qs, client_desc(request),
+        )
+        raise web.HTTPNotFound()
+    return url, extra_headers
+
+
 # --------------------------------------------------------------------------
 # Кодирование/декодирование целевых URL в безопасный для пути токен
 # --------------------------------------------------------------------------
@@ -128,6 +178,51 @@ def decode_url(token: str) -> str:
     return base64.urlsafe_b64decode((token + padding).encode('ascii')).decode('utf-8')
 
 
+# --------------------------------------------------------------------------
+# Подпись ссылок /res/
+#
+# Без подписи /<key>/res/<token> можно было бы вызвать с base64 ЛЮБОГО URL
+# и заставить прокси сходить куда угодно (в т.ч. во внутреннюю сеть), да
+# ещё и с доп. заголовками провайдера. Поэтому каждая ссылка, которую
+# прокси вписывает в плейлист, подписывается HMAC от (ключ провайдера, URL),
+# а handler_resource принимает только ссылки с верной подписью.
+#
+# Секрет генерируется один раз и хранится в data/secret.key - он ОБЯЗАН
+# переживать перезапуски: при смене секрета все ранее выданные ссылки
+# (в т.ч. закэшированные IPTV-приложениями списки каналов) перестают
+# работать до перезагрузки плейлиста в приложении.
+# --------------------------------------------------------------------------
+
+SECRET_FILE = os.path.join(providers_store.DATA_DIR, 'secret.key')
+SIG_BYTES = 16
+
+_signing_key = b''
+
+
+def load_signing_key():
+    global _signing_key
+    if os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE, 'r', encoding='ascii') as f:
+            _signing_key = bytes.fromhex(f.read().strip())
+        return
+    _signing_key = secrets.token_bytes(32)
+    os.makedirs(providers_store.DATA_DIR, exist_ok=True)
+    fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='ascii') as f:
+        f.write(_signing_key.hex())
+    log.info('Создан новый секрет подписи ссылок: %s', SECRET_FILE)
+
+
+def sign_url(key: str, url: str) -> str:
+    msg = f'{key}\n{url}'.encode('utf-8')
+    digest = hmac.new(_signing_key, msg, hashlib.sha256).digest()[:SIG_BYTES]
+    return base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')
+
+
+def signature_ok(key: str, url: str, sig: str) -> bool:
+    return hmac.compare_digest(sign_url(key, url), sig)
+
+
 def base_url_of(url: str) -> str:
     """Базовый URL (без имени файла) - для резолва относительных ссылок."""
     parsed = urlparse(url)
@@ -139,15 +234,16 @@ def proxy_root_for(key: str) -> str:
     return f'{SCHEME}://{HOST_NAME}:{PORT}/{key}'
 
 
-def make_proxy_url(proxy_root: str, abs_url: str) -> str:
-    """Строит ссылку вида {proxy_root}/res/<token>.<ext>."""
+def make_proxy_url(key: str, abs_url: str) -> str:
+    """Строит ссылку вида {proxy_root}/res/<sig>/<token>.<ext>."""
     parsed = urlparse(abs_url)
     last_seg = parsed.path.rsplit('/', 1)[-1]
     ext = last_seg.rsplit('.', 1)[-1].lower() if '.' in last_seg else ''
     token = encode_url(abs_url)
+    prefix = f'{proxy_root_for(key)}/res/{sign_url(key, abs_url)}'
     if ext and ext.isalnum() and len(ext) <= 6:
-        return f'{proxy_root}/res/{token}.{ext}'
-    return f'{proxy_root}/res/{token}'
+        return f'{prefix}/{token}.{ext}'
+    return f'{prefix}/{token}'
 
 
 # --------------------------------------------------------------------------
@@ -158,12 +254,11 @@ def rewrite_playlist(text: str, source_url: str, key: str) -> str:
     """Переписывает все ссылки в m3u8 (сегменты, вложенные плейлисты,
     URI="..." атрибуты тегов) на ссылки нашего прокси."""
     base = base_url_of(source_url)
-    proxy_root = proxy_root_for(key)
 
     def repl_attr(m):
         orig = m.group(1)
         abs_u = urljoin(base, orig)
-        return f'URI="{make_proxy_url(proxy_root, abs_u)}"'
+        return f'URI="{make_proxy_url(key, abs_u)}"'
 
     out_lines = []
     for raw_line in text.splitlines():
@@ -178,7 +273,7 @@ def rewrite_playlist(text: str, source_url: str, key: str) -> str:
         else:
             # Обычная строка без # - это URI сегмента или вложенного плейлиста
             abs_u = urljoin(base, stripped)
-            out_lines.append(make_proxy_url(proxy_root, abs_u))
+            out_lines.append(make_proxy_url(key, abs_u))
     return '\n'.join(out_lines) + '\n'
 
 
@@ -318,9 +413,7 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
 # --------------------------------------------------------------------------
 
 async def _serve_playlist(request: web.Request, key: str):
-    target_url, extra_headers = get_provider_entry(key)
-    if target_url is None:
-        raise web.HTTPNotFound(text='Unknown provider key: %s' % key)
+    target_url, extra_headers = require_provider(request, key)
     return await fetch_and_respond(
         request, key, target_url, force_playlist=True, extra_headers=extra_headers
     )
@@ -340,9 +433,7 @@ async def handler_playlist_ext(request: web.Request):
 
 async def handler_resource(request: web.Request):
     key = request.match_info['key']
-    _, extra_headers = get_provider_entry(key)
-    if extra_headers is None:
-        raise web.HTTPNotFound(text='Unknown provider key: %s' % key)
+    _, extra_headers = require_provider(request, key)
 
     raw = request.match_info['token']
     if '.' in raw:
@@ -355,15 +446,36 @@ async def handler_resource(request: web.Request):
     except Exception:
         raise web.HTTPBadRequest(text='Malformed resource token')
 
+    if not signature_ok(key, target_url, request.match_info['sig']):
+        raise web.HTTPForbidden(text='Invalid resource signature')
+
     force_playlist = ext.lower() in ('m3u8', 'm3u')
     return await fetch_and_respond(
         request, key, target_url, force_playlist=force_playlist, extra_headers=extra_headers
     )
 
 
+async def handler_resource_unsigned(request: web.Request):
+    """Ссылки старого формата /<key>/res/<token> (до подписи) - их могли
+    закэшировать IPTV-приложения, отвечаем понятной причиной вместо 405."""
+    require_provider(request, request.match_info['key'])
+    raise web.HTTPForbidden(text='Unsigned resource link: reload the playlist')
+
+
 async def handler_redirect_to_slash(request: web.Request):
     key = request.match_info['key']
+    require_provider(request, key)
     raise web.HTTPFound(f'/{key}/')
+
+
+async def handler_not_found(request: web.Request):
+    """Любой другой путь /<key>/... - 404. Для несуществующего ключа ещё и
+    warning в лог (через require_provider); /admin/... не логируем как
+    "несуществующий ключ" - это зарезервированное имя, а не провайдер."""
+    key = request.match_info['key']
+    if key not in providers_store.RESERVED_KEYS:
+        require_provider(request, key)
+    raise web.HTTPNotFound()
 
 
 async def handler_options(request: web.Request):
@@ -371,12 +483,10 @@ async def handler_options(request: web.Request):
 
 
 async def handler_index(request: web.Request):
-    """Небольшая служебная страница со списком доступных каналов."""
-    lines = ['IPTV proxy is running.\n\nAvailable channels:\n']
-    for k in providers_store.list_all():
-        lines.append(f'  http://{HOST_NAME}:{PORT}/{k}/')
-    lines.append(f'\nУправление провайдерами: http://{HOST_NAME}:{PORT}/admin/')
-    return web.Response(text='\n'.join(lines), content_type='text/plain')
+    """Корень ничего не раскрывает (ни список каналов, ни адрес /admin/) -
+    иначе любой, кто наткнулся на порт, сразу видит все ключи провайдеров.
+    Роут нужен явно: без него GET / получил бы 405 от OPTIONS catch-all."""
+    raise web.HTTPForbidden()
 
 
 # --------------------------------------------------------------------------
@@ -459,9 +569,11 @@ def render_admin_page(providers, message=None, error=None,
     error_html = f'<p class="msg err">{e(error)}</p>' if error else ''
     form_title = 'Изменить провайдера' if edit_mode else 'Добавить провайдера'
     key_field = (
-        f'<input type="text" name="key" value="{e(form_key)}" readonly>'
+        f'<input type="text" id="key" name="key" value="{e(form_key)}" readonly>'
         if edit_mode else
-        '<input type="text" name="key" placeholder="one" required pattern="[A-Za-z0-9_-]+">'
+        f'<input type="text" id="key" name="key" value="{e(form_key)}" placeholder="one"'
+        ' required pattern="[A-Za-z0-9_-]+">'
+        '<button type="button" onclick="generateKey()">Сгенерировать</button>'
     )
     cancel_link = '<a href="/admin/">Отмена</a>' if edit_mode else ''
 
@@ -480,6 +592,8 @@ def render_admin_page(providers, message=None, error=None,
   button.danger {{ color: #b00020; }}
   label {{ display: block; margin-top: 0.75em; }}
   input[type=text], textarea {{ width: 100%; box-sizing: border-box; padding: 0.4em; }}
+  .key-row {{ display: flex; gap: 0.5em; }}
+  .key-row input {{ flex: 1; font-family: monospace; }}
   textarea {{ height: 4em; font-family: monospace; }}
   .msg {{ padding: 0.6em 1em; border-radius: 4px; }}
   .msg.ok {{ background: #e6ffed; border: 1px solid #4caf50; }}
@@ -489,8 +603,6 @@ def render_admin_page(providers, message=None, error=None,
 </head>
 <body>
 <h1>IPTV proxy - провайдеры</h1>
-<p><em>Без авторизации: любой, кто откроет эту страницу, может добавлять,
-менять и удалять провайдеров.</em></p>
 {message_html}{error_html}
 <table>
   <thead><tr><th>Ключ</th><th>URL</th><th>Заголовки</th><th>Действия</th></tr></thead>
@@ -499,9 +611,8 @@ def render_admin_page(providers, message=None, error=None,
 
 <h2>{form_title}</h2>
 <form method="post" action="/admin/save">
-  <label>Ключ (используется в адресе /&lt;ключ&gt;/)
-    {key_field}
-  </label>
+  <label for="key">Ключ (используется в адресе /&lt;ключ&gt;/)</label>
+  <div class="key-row">{key_field}</div>
   <label>URL плейлиста провайдера
     <input type="text" name="url" value="{e(form_url)}" placeholder="https://provide.one/list.m3u8" required>
   </label>
@@ -513,6 +624,20 @@ def render_admin_page(providers, message=None, error=None,
   </details>
   <p><button type="submit">Сохранить</button> {cancel_link}</p>
 </form>
+<script>
+function generateKey() {{
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let key = '';
+  while (key.length < 12) {{
+    for (const b of crypto.getRandomValues(new Uint8Array(16))) {{
+      // 248 = 62 * 4: байты >= 248 отбрасываем, иначе первые символы
+      // алфавита выпадали бы чаще остальных.
+      if (b < 248 && key.length < 12) key += alphabet[b % 62];
+    }}
+  }}
+  document.getElementById('key').value = key;
+}}
+</script>
 </body>
 </html>
 '''
@@ -558,43 +683,127 @@ async def handler_admin_save(request: web.Request):
         )
         return web.Response(text=body, content_type='text/html', status=400)
 
+    old_url, _ = providers_store.get(key)
     await providers_store.save(key, url, headers)
+    # Значения заголовков не логируем - там бывают токены провайдера.
+    if old_url is None:
+        log.warning('Админка: добавлен провайдер %r url=%r заголовки=%r %s',
+                    key, url, sorted(headers), client_desc(request))
+    else:
+        log.warning('Админка: изменён провайдер %r url=%r (было %r) заголовки=%r %s',
+                    key, url, old_url, sorted(headers), client_desc(request))
     raise web.HTTPSeeOther('/admin/?msg=saved')
 
 
 async def handler_admin_delete(request: web.Request):
     key = request.match_info['key']
+    old_url, _ = providers_store.get(key)
     await providers_store.delete(key)
+    if old_url is not None:
+        log.warning('Админка: удалён провайдер %r url=%r %s', key, old_url, client_desc(request))
     raise web.HTTPSeeOther('/admin/?msg=deleted')
 
 
-def _basic_auth_ok(request: web.Request) -> bool:
+def _basic_auth_user(request: web.Request):
+    """(user, ok) из заголовка Authorization; (None, False) - если его нет."""
     auth_header = request.headers.get('Authorization', '')
     scheme, _, encoded = auth_header.partition(' ')
     if scheme != 'Basic' or not encoded:
-        return False
+        return None, False
     try:
-        decoded = base64.b64decode(encoded).decode('utf-8')
+        decoded = base64.b64decode(encoded, validate=True)
     except Exception:
+        return '', False
+    user, _, password = decoded.partition(b':')
+    # Сравниваем БАЙТЫ: hmac.compare_digest на str падает с TypeError на
+    # не-ASCII символах (кириллический пароль давал 500). Оба сравнения
+    # выполняются всегда - без короткого замыкания по неверному логину.
+    # compare_digest - сравнение за постоянное время (без утечки через тайминг).
+    user_ok = hmac.compare_digest(user, ADMIN_USER.encode('utf-8'))
+    password_ok = hmac.compare_digest(password, ADMIN_PASSWORD.encode('utf-8'))
+    return user.decode('utf-8', errors='replace'), user_ok and password_ok
+
+
+# ip -> [неудачных попыток в текущем окне, начало окна, заблокирован до]
+_auth_failures = {}
+
+
+def _auth_blocked_for(ip: str, now: float) -> int:
+    """Сколько секунд ещё действует блокировка IP (0 - не заблокирован)."""
+    state = _auth_failures.get(ip)
+    if state and state[2] > now:
+        return int(state[2] - now) + 1
+    return 0
+
+
+def _register_auth_failure(ip: str, now: float) -> bool:
+    """Учитывает неудачную попытку; True - если IP только что заблокирован."""
+    if len(_auth_failures) > 10000:
+        # Не даём словарю расти бесконечно при переборе с множества IP.
+        for stale_ip in [i for i, s in _auth_failures.items()
+                         if s[2] <= now and now - s[1] > AUTH_WINDOW]:
+            del _auth_failures[stale_ip]
+    state = _auth_failures.get(ip)
+    if state is None or now - state[1] > AUTH_WINDOW:
+        state = _auth_failures[ip] = [0, now, 0.0]
+    state[0] += 1
+    if state[0] >= AUTH_MAX_FAILURES:
+        state[0], state[1], state[2] = 0, now, now + AUTH_BLOCK
+        return True
+    return False
+
+
+def _same_origin(request: web.Request) -> bool:
+    """POST в /admin/ принимаем только со страниц самого прокси (защита от
+    CSRF: Basic Auth браузер подставляет в запрос с ЛЮБОГО сайта). Браузеры
+    всегда шлют Origin на POST; Referer - запасной вариант."""
+    source = request.headers.get('Origin') or request.headers.get('Referer')
+    if not source or source == 'null':
         return False
-    user, _, password = decoded.partition(':')
-    # hmac.compare_digest - сравнение за постоянное время, чтобы не давать
-    # утечку через тайминг посимвольного сравнения пароля.
-    return hmac.compare_digest(user, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    netloc = urlparse(source).netloc.lower()
+    allowed = {request.host.lower(), HOST_NAME.lower(), f'{HOST_NAME}:{PORT}'.lower()}
+    return netloc in allowed
 
 
 @web.middleware
 async def admin_auth_middleware(request: web.Request, handler):
     """HTTP Basic Auth на /admin/* - без системы пользователей, один общий
     логин/пароль из .env (ADMIN_USER/ADMIN_PASSWORD). Если ADMIN_PASSWORD
-    не задан, проверка выключена - /admin/ открыт, как раньше."""
-    if ADMIN_PASSWORD and request.path.startswith('/admin'):
-        if not _basic_auth_ok(request):
-            return web.Response(
-                status=401,
-                headers={'WWW-Authenticate': 'Basic realm="iptv-proxy admin"'},
-                text='Unauthorized',
-            )
+    не задан, /admin/ выключен (404)."""
+    if not request.path.startswith('/admin'):
+        return await handler(request)
+    if not ADMIN_PASSWORD:
+        raise web.HTTPNotFound()
+
+    ip = client_ip(request)
+    now = time.monotonic()
+    blocked_for = _auth_blocked_for(ip, now)
+    if blocked_for:
+        return web.Response(status=429, text='Too Many Requests',
+                            headers={'Retry-After': str(blocked_for)})
+
+    user, ok = _basic_auth_user(request)
+    if not ok:
+        # Запрос вовсе без логина - обычный первый заход браузера (он в
+        # ответ на 401 покажет окно входа), такое попыткой не считаем.
+        if user is not None:
+            log.warning('Админка: неверный логин/пароль (логин %r): %s %r %s',
+                        user, request.method, request.path_qs, client_desc(request))
+            if _register_auth_failure(ip, now):
+                log.warning('Админка: IP %s заблокирован на %d с после %d неверных попыток',
+                            ip, AUTH_BLOCK, AUTH_MAX_FAILURES)
+        return web.Response(
+            status=401,
+            headers={'WWW-Authenticate': 'Basic realm="iptv-proxy admin", charset="UTF-8"'},
+            text='Unauthorized',
+        )
+    _auth_failures.pop(ip, None)
+
+    if request.method == 'POST' and not _same_origin(request):
+        log.warning('Админка: отклонён POST с чужого сайта (CSRF?) origin=%r referer=%r: %r %s',
+                    request.headers.get('Origin'), request.headers.get('Referer'),
+                    request.path_qs, client_desc(request))
+        raise web.HTTPForbidden(text='Cross-site request rejected')
     return await handler(request)
 
 
@@ -605,6 +814,7 @@ async def admin_auth_middleware(request: web.Request, handler):
 async def on_startup(app):
     app['session'] = aiohttp.ClientSession()
     providers_store.load(seed_from=getattr(config, 'provider', None))
+    load_signing_key()
     log.info('IPTV proxy started on 0.0.0.0:%s', PORT)
     providers = providers_store.list_all()
     if not providers:
@@ -612,7 +822,8 @@ async def on_startup(app):
     for k in providers:
         log.info("  channel '%s' -> %s://%s:%s/%s/", k, SCHEME, HOST_NAME, PORT, k)
     if not ADMIN_PASSWORD:
-        log.warning("ADMIN_PASSWORD не задан - /admin/ открыт БЕЗ пароля")
+        log.warning("ADMIN_PASSWORD не задан - /admin/ ВЫКЛЮЧЕН (404). "
+                    "Задайте ADMIN_PASSWORD в .env, чтобы управлять провайдерами")
 
 
 async def on_cleanup(app):
@@ -636,7 +847,10 @@ def create_app() -> web.Application:
     app.router.add_get('/{key}/playlist.m3u8', handler_playlist_ext)
     app.router.add_get('/{key}', handler_redirect_to_slash)
     app.router.add_get('/{key}/', handler_playlist)
-    app.router.add_get('/{key}/res/{token}', handler_resource)
+    app.router.add_get('/{key}/res/{sig}/{token}', handler_resource)
+    app.router.add_get('/{key}/res/{token}', handler_resource_unsigned)
+    # Последним - всё, что не совпало выше (иначе было бы 405 от OPTIONS).
+    app.router.add_get('/{key}/{tail:.*}', handler_not_found)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
