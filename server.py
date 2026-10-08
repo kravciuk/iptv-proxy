@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import secrets
+import ssl
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -109,10 +110,12 @@ if not re.match(r'^[A-Za-z0-9_-]+$', ADMIN_PATH):
     )
 ADMIN_PREFIX = f'/{ADMIN_PATH}'
 
-# Брать IP клиента из X-Forwarded-For (последний адрес - тот, что дописал
-# наш nginx). Включать ТОЛЬКО если прокси доступен исключительно через
-# nginx: при прямом доступе заголовок подделывается клиентом, и блокировку
-# перебора пароля можно обойти. Без nginx/выключено - IP соединения.
+# Доверять заголовкам nginx: IP клиента из X-Forwarded-For (последний адрес -
+# тот, что дописал наш nginx), адрес для ссылок из X-Forwarded-Proto/Host
+# (см. public_origin). Включать ТОЛЬКО если прокси доступен исключительно
+# через nginx: при прямом доступе заголовки подделываются клиентом, и
+# блокировку перебора пароля можно обойти. Без nginx/выключено - IP
+# соединения и адрес из конфигурации.
 TRUST_X_FORWARDED_FOR = getattr(config, 'trust_x_forwarded_for', False)
 
 # Защита /admin/ от перебора пароля: после AUTH_MAX_FAILURES неверных
@@ -126,6 +129,18 @@ SCHEME = getattr(config, 'scheme', 'http')
 USER_AGENT = getattr(config, 'user_agent', 'Mozilla/5.0 (IPTV-Proxy)')
 CONNECT_TIMEOUT = getattr(config, 'connect_timeout', 10)
 READ_TIMEOUT = getattr(config, 'read_timeout', 30)
+
+# SSL для провайдеров с verify_ssl=false (галочка "Не проверять SSL" в
+# панели): сертификат не проверяется (самоподписанный, просроченный, на
+# другой домен) и допускаются устаревшие TLS 1.0/1.1 и слабые шифры, которые
+# OpenSSL 3 по умолчанию отвергает. Трафик по-прежнему шифруется, но
+# подлинность сервера провайдера не проверяется.
+INSECURE_SSL = ssl.create_default_context()
+INSECURE_SSL.check_hostname = False
+INSECURE_SSL.verify_mode = ssl.CERT_NONE
+INSECURE_SSL.minimum_version = ssl.TLSVersion.TLSv1
+INSECURE_SSL.set_ciphers('DEFAULT:@SECLEVEL=0')
+INSECURE_SSL.options |= getattr(ssl, 'OP_LEGACY_SERVER_CONNECT', 0)
 
 CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
@@ -269,17 +284,32 @@ def base_url_of(url: str) -> str:
     return f'{parsed.scheme}://{parsed.netloc}{path}'
 
 
-def proxy_root_for(key: str) -> str:
-    return f'{SCHEME}://{HOST_NAME}:{PORT}/{key}'
+HOST_HEADER_RE = re.compile(r'^(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$')
 
 
-def make_proxy_url(key: str, abs_url: str) -> str:
-    """Строит ссылку вида {proxy_root}/res/<sig>/<token>.<ext>."""
+def public_origin(request: web.Request) -> str:
+    """Адрес прокси для ссылок в плейлисте: <схема>://<хост>[:<порт>].
+
+    За nginx (trust_x_forwarded_for) - тот адрес, по которому клиент
+    реально пришёл: схема из X-Forwarded-Proto, хост и порт из Host. Тогда
+    http-клиент получает http-ссылки, https-клиент - https, и все запросы
+    идут через nginx, а не напрямую на порт прокси. Иначе (и если заголовки
+    странные) - из конфигурации: scheme, host_name, port."""
+    if TRUST_X_FORWARDED_FOR:
+        proto = request.headers.get('X-Forwarded-Proto', '').split(',', 1)[0].strip().lower()
+        host = request.headers.get('Host', '').strip()
+        if proto in ('http', 'https') and HOST_HEADER_RE.match(host):
+            return f'{proto}://{host}'
+    return f'{SCHEME}://{HOST_NAME}:{PORT}'
+
+
+def make_proxy_url(origin: str, key: str, abs_url: str) -> str:
+    """Строит ссылку вида {origin}/{key}/res/<sig>/<token>.<ext>."""
     parsed = urlparse(abs_url)
     last_seg = parsed.path.rsplit('/', 1)[-1]
     ext = last_seg.rsplit('.', 1)[-1].lower() if '.' in last_seg else ''
     token = encode_url(abs_url)
-    prefix = f'{proxy_root_for(key)}/res/{sign_url(key, abs_url)}'
+    prefix = f'{origin}/{key}/res/{sign_url(key, abs_url)}'
     if ext and ext.isalnum() and len(ext) <= 6:
         return f'{prefix}/{token}.{ext}'
     return f'{prefix}/{token}'
@@ -289,7 +319,7 @@ def make_proxy_url(key: str, abs_url: str) -> str:
 # Перезапись плейлиста
 # --------------------------------------------------------------------------
 
-def rewrite_playlist(text: str, source_url: str, key: str) -> str:
+def rewrite_playlist(text: str, source_url: str, key: str, origin: str) -> str:
     """Переписывает все ссылки в m3u8 (сегменты, вложенные плейлисты,
     URI="..." атрибуты тегов) на ссылки нашего прокси."""
     base = base_url_of(source_url)
@@ -297,7 +327,7 @@ def rewrite_playlist(text: str, source_url: str, key: str) -> str:
     def repl_attr(m):
         orig = m.group(1)
         abs_u = urljoin(base, orig)
-        return f'URI="{make_proxy_url(key, abs_u)}"'
+        return f'URI="{make_proxy_url(origin, key, abs_u)}"'
 
     out_lines = []
     for raw_line in text.splitlines():
@@ -312,7 +342,7 @@ def rewrite_playlist(text: str, source_url: str, key: str) -> str:
         else:
             # Обычная строка без # - это URI сегмента или вложенного плейлиста
             abs_u = urljoin(base, stripped)
-            out_lines.append(make_proxy_url(key, abs_u))
+            out_lines.append(make_proxy_url(origin, key, abs_u))
     return '\n'.join(out_lines) + '\n'
 
 
@@ -337,10 +367,15 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
         total=None, sock_connect=CONNECT_TIMEOUT, sock_read=READ_TIMEOUT
     )
 
+    ssl_ctx = True if providers_store.verify_ssl(key) else INSECURE_SSL
+
     try:
-        upstream = await session.get(target_url, headers=headers, timeout=timeout)
+        upstream = await session.get(target_url, headers=headers, timeout=timeout, ssl=ssl_ctx)
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
         log.warning('Upstream fetch failed for %s: %s', target_url, e)
+        if isinstance(e, aiohttp.ClientSSLError):
+            log.warning("Ошибка SSL у провайдера %r - если провайдеру нельзя исправить "
+                        "сертификат/TLS, включите для него \"Не проверять SSL\" в панели", key)
         return web.Response(status=502, text='Upstream error', headers=CORS_HEADERS)
 
     async with upstream:
@@ -372,7 +407,11 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
                         status=upstream.status, text=text or 'Upstream error', headers=CORS_HEADERS
                     )
 
-                rewritten = rewrite_playlist(text, target_url, key)
+                # База для относительных ссылок - адрес, откуда плейлист
+                # реально пришёл: aiohttp сам проходит редиректы, и после
+                # редиректа на CDN/https сегменты лежат рядом с конечным
+                # URL, а не с запрошенным.
+                rewritten = rewrite_playlist(text, str(upstream.url), key, public_origin(request))
                 resp_headers = dict(CORS_HEADERS)
                 resp_headers['Cache-Control'] = 'no-cache'
                 return web.Response(
@@ -584,7 +623,7 @@ def _headers_to_text(headers: dict) -> str:
 
 def render_admin_page(providers, message=None, error=None,
                        form_key='', form_url='', form_headers_text='',
-                       original_key=''):
+                       form_verify_ssl=True, original_key=''):
     """original_key - ключ редактируемой записи; пусто - форма добавления."""
     e = html.escape
     edit_mode = bool(original_key)
@@ -593,10 +632,11 @@ def render_admin_page(providers, message=None, error=None,
         entry = providers[key]
         n_headers = len(entry['headers'])
         headers_note = f'{n_headers} доп. заголовок(ов)' if n_headers else '-'
+        ssl_note = '' if entry['verify_ssl'] else '<p class="hint">SSL не проверяется</p>'
         rows.append(f'''
         <tr>
           <td><code>{e(key)}</code></td>
-          <td class="url-cell"><code>{e(entry['url'])}</code></td>
+          <td class="url-cell"><code>{e(entry['url'])}</code>{ssl_note}</td>
           <td>{headers_note}</td>
           <td class="actions">
             <a href="/{e(key)}/" target="_blank">Открыть</a>
@@ -638,6 +678,7 @@ def render_admin_page(providers, message=None, error=None,
   form.inline {{ display: inline; }}
   button.danger {{ color: #b00020; }}
   label {{ display: block; margin-top: 0.75em; }}
+  label.checkbox {{ font-weight: normal; }}
   input[type=text], textarea {{ width: 100%; box-sizing: border-box; padding: 0.4em; }}
   .key-row {{ display: flex; gap: 0.5em; }}
   .key-row input {{ flex: 1; font-family: monospace; }}
@@ -665,6 +706,11 @@ def render_admin_page(providers, message=None, error=None,
   <label>URL плейлиста провайдера
     <input type="text" name="url" value="{e(form_url)}" placeholder="https://provide.one/list.m3u8" required>
   </label>
+  <label class="checkbox"><input type="checkbox" name="insecure_ssl" value="1"{'' if form_verify_ssl else ' checked'}>
+    Не проверять SSL-сертификат провайдера</label>
+  <p class="hint">Только если провайдер отдаёт https с самоподписанным/просроченным
+    сертификатом или устаревшим TLS и в логе ошибки SSL. Подлинность сервера
+    провайдера при этом не проверяется.</p>
   <details>
     <summary>Дополнительные заголовки (опционально)</summary>
     <label>По одному заголовку на строку, формат "Имя: значение"
@@ -707,7 +753,7 @@ async def handler_admin_edit(request: web.Request):
     body = render_admin_page(
         providers_store.list_all(),
         form_key=key, form_url=url, form_headers_text=_headers_to_text(headers),
-        original_key=key,
+        form_verify_ssl=providers_store.verify_ssl(key), original_key=key,
     )
     return web.Response(text=body, content_type='text/html')
 
@@ -717,6 +763,7 @@ async def handler_admin_save(request: web.Request):
     key = (data.get('key') or '').strip()
     url = (data.get('url') or '').strip()
     headers_text = data.get('headers') or ''
+    verify_ssl = not data.get('insecure_ssl')
     # Есть original_key - это форма редактирования (ключ мог поменяться),
     # нет - форма добавления.
     original_key = (data.get('original_key') or '').strip()
@@ -740,25 +787,26 @@ async def handler_admin_save(request: web.Request):
         body = render_admin_page(
             existing, error=error,
             form_key=key, form_url=url, form_headers_text=headers_text,
-            original_key=original_key,
+            form_verify_ssl=verify_ssl, original_key=original_key,
         )
         return web.Response(text=body, content_type='text/html', status=400)
 
     # Значения заголовков не логируем - там бывают токены провайдера.
     if not original_key:
-        await providers_store.save(key, url, headers)
-        log.warning('Админка: добавлен провайдер %r url=%r заголовки=%r %s',
-                    key, url, sorted(headers), client_desc(request))
+        await providers_store.save(key, url, headers, verify_ssl)
+        log.warning('Админка: добавлен провайдер %r url=%r заголовки=%r verify_ssl=%s %s',
+                    key, url, sorted(headers), verify_ssl, client_desc(request))
     elif key != original_key:
         old_url = existing[original_key]['url']
-        await providers_store.rename(original_key, key, url, headers)
-        log.warning('Админка: переименован провайдер %r -> %r url=%r (было %r) заголовки=%r %s',
-                    original_key, key, url, old_url, sorted(headers), client_desc(request))
+        await providers_store.rename(original_key, key, url, headers, verify_ssl)
+        log.warning('Админка: переименован провайдер %r -> %r url=%r (было %r) заголовки=%r '
+                    'verify_ssl=%s %s', original_key, key, url, old_url, sorted(headers),
+                    verify_ssl, client_desc(request))
     else:
         old_url = existing[key]['url']
-        await providers_store.save(key, url, headers)
-        log.warning('Админка: изменён провайдер %r url=%r (было %r) заголовки=%r %s',
-                    key, url, old_url, sorted(headers), client_desc(request))
+        await providers_store.save(key, url, headers, verify_ssl)
+        log.warning('Админка: изменён провайдер %r url=%r (было %r) заголовки=%r verify_ssl=%s %s',
+                    key, url, old_url, sorted(headers), verify_ssl, client_desc(request))
     raise web.HTTPSeeOther(f'{ADMIN_PREFIX}/?msg=saved')
 
 

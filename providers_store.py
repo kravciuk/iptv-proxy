@@ -8,7 +8,8 @@
 (панель управления /<ADMIN_PATH>/, мгновенно), так и вручную (правка файла, применяется после
 перезапуска - как раньше config.py).
 
-Формат файла: {"<key>": {"url": "...", "headers": {...}}, ...}
+Формат файла: {"<key>": {"url": "...", "headers": {...}, "verify_ssl": true}, ...}
+("verify_ssl" необязателен, по умолчанию true - см. server.py, INSECURE_SSL).
 """
 
 import asyncio
@@ -27,10 +28,14 @@ _lock = asyncio.Lock()
 
 def _normalize(entry):
     """Приводит запись провайдера (строка-URL либо dict) к единому виду
-    {"url": ..., "headers": {...}}."""
+    {"url": ..., "headers": {...}, "verify_ssl": bool}."""
     if isinstance(entry, dict):
-        return {'url': entry.get('url', ''), 'headers': dict(entry.get('headers') or {})}
-    return {'url': entry, 'headers': {}}
+        return {
+            'url': entry.get('url', ''),
+            'headers': dict(entry.get('headers') or {}),
+            'verify_ssl': entry.get('verify_ssl', True) is not False,
+        }
+    return {'url': entry, 'headers': {}, 'verify_ssl': True}
 
 
 def _read_from_disk():
@@ -78,23 +83,29 @@ def get(key):
     return entry['url'], entry['headers']
 
 
+def verify_ssl(key):
+    """Проверять ли SSL-сертификат провайдера (по умолчанию - да)."""
+    entry = PROVIDERS.get(key)
+    return entry is None or entry['verify_ssl']
+
+
 def list_all():
-    """dict {key: {"url":..., "headers":...}} - для рендера панели управления."""
+    """dict {key: {"url":..., "headers":..., "verify_ssl":...}} - для рендера панели управления."""
     return dict(PROVIDERS)
 
 
-async def save(key, url, headers):
+async def save(key, url, headers, verify_ssl=True):
     async with _lock:
-        PROVIDERS[key] = {'url': url, 'headers': dict(headers or {})}
+        PROVIDERS[key] = {'url': url, 'headers': dict(headers or {}), 'verify_ssl': verify_ssl}
         _write_to_disk(PROVIDERS)
 
 
-async def rename(old_key, new_key, url, headers):
+async def rename(old_key, new_key, url, headers, verify_ssl=True):
     """Смена ключа одной записью на диск (без промежуточного состояния,
     где провайдера нет ни под старым, ни под новым ключом)."""
     async with _lock:
         PROVIDERS.pop(old_key, None)
-        PROVIDERS[new_key] = {'url': url, 'headers': dict(headers or {})}
+        PROVIDERS[new_key] = {'url': url, 'headers': dict(headers or {}), 'verify_ssl': verify_ssl}
         _write_to_disk(PROVIDERS)
 
 
