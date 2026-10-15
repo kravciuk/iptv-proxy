@@ -7,6 +7,14 @@ services:
     image: iptv-proxy:latest
     container_name: iptv-proxy
     restart: unless-stopped
+    # Лог (docker logs) - не больше 3 файлов по 10 МБ, старые записи
+    # удаляются. Без этого лог растёт бесконечно (при LOG_LEVEL=DEBUG -
+    # строка на каждый сегмент). Пропадает при пересоздании контейнера.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       # Единственное место, откуда сервер узнаёт порт, когда запущен в
       # Docker. Значение подставляется из .env (или переменных окружения
