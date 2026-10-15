@@ -33,6 +33,7 @@ import re
 import secrets
 import ssl
 import time
+from collections import OrderedDict
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -204,6 +205,28 @@ def client_desc(request: web.Request) -> str:
         request.remote, request.headers.get('X-Forwarded-For'),
         request.headers.get('User-Agent'),
     )
+
+
+# Последние клиенты, успешно получившие плейлист (для панели управления):
+# ip -> {'time', 'key', 'ua', 'count'}, свежие - в конце. Только в памяти,
+# при рестарте сбрасывается. Уникальные IP: live-плеер перезапрашивает
+# плейлист каждые несколько секунд, и без этого один зритель вытеснил бы
+# всех остальных.
+RECENT_CLIENTS_MAX = 10
+_recent_clients = OrderedDict()
+
+
+def remember_client(request: web.Request, key: str):
+    ip = client_ip(request)
+    entry = _recent_clients.pop(ip, None)
+    _recent_clients[ip] = {
+        'time': time.time(),
+        'key': key,
+        'ua': (request.headers.get('User-Agent') or '')[:200],
+        'count': entry['count'] + 1 if entry else 1,
+    }
+    if len(_recent_clients) > RECENT_CLIENTS_MAX:
+        _recent_clients.popitem(last=False)
 
 
 def require_provider(request: web.Request, key: str):
@@ -412,6 +435,7 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
                 # редиректа на CDN/https сегменты лежат рядом с конечным
                 # URL, а не с запрошенным.
                 rewritten = rewrite_playlist(text, str(upstream.url), key, public_origin(request))
+                remember_client(request, key)
                 resp_headers = dict(CORS_HEADERS)
                 resp_headers['Cache-Control'] = 'no-cache'
                 return web.Response(
@@ -621,6 +645,17 @@ def _headers_to_text(headers: dict) -> str:
     return '\n'.join(f'{k}: {v}' for k, v in (headers or {}).items())
 
 
+def _ago(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f'{seconds} с назад'
+    if seconds < 3600:
+        return f'{seconds // 60} мин назад'
+    if seconds < 86400:
+        return f'{seconds // 3600} ч назад'
+    return f'{seconds // 86400} дн назад'
+
+
 def render_admin_page(providers, message=None, error=None,
                        form_key='', form_url='', form_headers_text='',
                        form_verify_ssl=True, original_key=''):
@@ -648,6 +683,22 @@ def render_admin_page(providers, message=None, error=None,
         </tr>''')
 
     rows_html = ''.join(rows) if rows else '<tr><td colspan="4"><em>Провайдеров пока нет</em></td></tr>'
+
+    now = time.time()
+    client_rows = []
+    for ip, c in reversed(_recent_clients.items()):
+        when = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(c['time']))
+        client_rows.append(f'''
+        <tr>
+          <td><code>{e(ip)}</code></td>
+          <td title="{when}">{_ago(now - c['time'])}</td>
+          <td><code>{e(c['key'])}</code></td>
+          <td class="url-cell">{e(c['ua']) or '-'}</td>
+          <td>{c['count']}</td>
+        </tr>''')
+    clients_html = ''.join(client_rows) or (
+        '<tr><td colspan="5"><em>С момента запуска плейлисты никто не запрашивал</em></td></tr>'
+    )
     message_html = f'<p class="msg ok">{e(message)}</p>' if message else ''
     error_html = f'<p class="msg err">{e(error)}</p>' if error else ''
     form_title = 'Изменить провайдера' if edit_mode else 'Добавить провайдера'
@@ -719,6 +770,14 @@ def render_admin_page(providers, message=None, error=None,
   </details>
   <p><button type="submit">Сохранить</button> {cancel_link}</p>
 </form>
+
+<h2>Последние клиенты</h2>
+<p class="hint">{RECENT_CLIENTS_MAX} последних уникальных IP, успешно получивших плейлист.
+  Хранится только в памяти - сбрасывается при рестарте.</p>
+<table>
+  <thead><tr><th>IP</th><th>Последнее обращение</th><th>Ключ</th><th>User-Agent</th><th>Обращений</th></tr></thead>
+  <tbody>{clients_html}</tbody>
+</table>
 <script>
 function generateKey() {{
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
