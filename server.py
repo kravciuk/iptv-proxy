@@ -383,6 +383,22 @@ def build_upstream_headers(request: web.Request, extra: dict) -> dict:
     return headers
 
 
+async def pipe_body(resp, upstream, head=b''):
+    """Перекачивает тело ответа провайдера клиенту."""
+    try:
+        if head:
+            await resp.write(head)
+        async for chunk in upstream.content.iter_chunked(65536):
+            await resp.write(chunk)
+        await resp.write_eof()
+    except (aiohttp.ClientError, ConnectionError, asyncio.TimeoutError):
+        # клиент/провайдер обрубил соединение - это нормально для live.
+        # ConnectionError покрывает и BrokenPipe/"Connection lost" от клиента,
+        # и ConnectionResetError.
+        pass
+    return resp
+
+
 async def fetch_and_respond(request, key, target_url, force_playlist, extra_headers):
     session: aiohttp.ClientSession = request.app['session']
     headers = build_upstream_headers(request, extra_headers)
@@ -482,14 +498,7 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
             for k, v in CORS_HEADERS.items():
                 resp.headers[k] = v
             await resp.prepare(request)
-            await resp.write(head)
-            try:
-                async for chunk in upstream.content.iter_chunked(65536):
-                    await resp.write(chunk)
-            except (aiohttp.ClientError, ConnectionResetError):
-                pass
-            await resp.write_eof()
-            return resp
+            return await pipe_body(resp, upstream, head)
 
         # Бинарный ресурс (сегмент .ts/.m4s/.aac, ключ шифрования и т.п.)
         # - стримим "на лету", не буферизируя целиком в память.
@@ -500,14 +509,7 @@ async def fetch_and_respond(request, key, target_url, force_playlist, extra_head
         for k, v in CORS_HEADERS.items():
             resp.headers[k] = v
         await resp.prepare(request)
-        try:
-            async for chunk in upstream.content.iter_chunked(65536):
-                await resp.write(chunk)
-        except (aiohttp.ClientError, ConnectionResetError):
-            # клиент/провайдер обрубил соединение - это нормально для live
-            pass
-        await resp.write_eof()
-        return resp
+        return await pipe_body(resp, upstream)
 
 
 # --------------------------------------------------------------------------
